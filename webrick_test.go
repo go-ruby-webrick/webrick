@@ -154,6 +154,11 @@ func TestHTTPUtilsDeterministic(t *testing.T) {
 	if Dequote("\\x") != "x" {
 		t.Errorf("dequote escape: %q", Dequote("\\x"))
 	}
+	// Quote's escape branch (MRI's \1=0x01 quirk): a '"' and a '\' each become
+	// "\x01" preceded by a backslash.
+	if Quote("a\"b\\c") != "\"a\\\x01b\\\x01c\"" {
+		t.Errorf("quote escape = %q", Quote("a\"b\\c"))
+	}
 	// q-values: blank, malformed, no-q default.
 	if len(ParseQValues("")) != 0 {
 		t.Error("qv empty")
@@ -173,6 +178,152 @@ func TestHTTPUtilsDeterministic(t *testing.T) {
 	}
 	if got := ParseQValues("a;q=0."); len(got) != 0 {
 		t.Errorf("qv trailing dot = %v", got)
+	}
+}
+
+// TestResponseBytesDeterministic builds responses and checks their bytes
+// without the MRI oracle, so the Windows/qemu (no-ruby) lanes cover the
+// response builder fully.
+func TestResponseBytesDeterministic(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ServerSoftware = "WEBrick/test"
+	cfg.ServerName = "h"
+
+	// plain 200 with body.
+	res := NewResponse(cfg)
+	res.RequestMethod = "GET"
+	res.SetStatus(200)
+	res.Set("content-type", "text/plain")
+	res.Body = []byte("hello")
+	out, err := res.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nServer: WEBrick/test\r\n" +
+		"Content-Length: 5\r\nConnection: Keep-Alive\r\n\r\nhello"
+	if string(out) != want {
+		t.Errorf("200 bytes:\n got %q\n want %q", out, want)
+	}
+
+	// chunked body.
+	res = NewResponse(cfg)
+	res.RequestMethod = "GET"
+	res.SetStatus(200)
+	res.SetChunked(true)
+	res.Body = []byte("Wiki")
+	out, _ = res.Bytes()
+	if !strings.Contains(string(out), "Transfer-Encoding: chunked\r\n") ||
+		!strings.HasSuffix(string(out), "4\r\nWiki\r\n0\r\n\r\n") {
+		t.Errorf("chunked bytes = %q", out)
+	}
+
+	// chunked with empty body still terminates.
+	res = NewResponse(cfg)
+	res.RequestMethod = "GET"
+	res.SetStatus(200)
+	res.SetChunked(true)
+	res.Body = nil
+	out, _ = res.Bytes()
+	if !strings.HasSuffix(string(out), "0\r\n\r\n") {
+		t.Errorf("empty chunked = %q", out)
+	}
+
+	// HEAD suppresses the body.
+	res = NewResponse(cfg)
+	res.RequestMethod = "HEAD"
+	res.SetStatus(200)
+	res.Set("content-type", "text/plain")
+	res.Body = []byte("hello")
+	out, _ = res.Bytes()
+	if strings.Contains(string(out), "hello") {
+		t.Error("HEAD should suppress body")
+	}
+
+	// 204 no-content clears the body.
+	res = NewResponse(cfg)
+	res.RequestMethod = "GET"
+	res.SetStatus(204)
+	res.Body = []byte("ignored")
+	out, _ = res.Bytes()
+	if strings.Contains(string(out), "ignored") || strings.Contains(string(out), "Content-Length") {
+		t.Errorf("204 = %q", out)
+	}
+
+	// redirect: set_redirect body + Location.
+	res = NewResponse(cfg)
+	res.RequestMethod = "GET"
+	st := res.SetRedirect(StatusFound(), "http://example.com/new")
+	if st.Code != 302 {
+		t.Errorf("redirect status = %d", st.Code)
+	}
+	res.SetStatus(st.Code)
+	out, _ = res.Bytes()
+	body := string(out)
+	if !strings.Contains(body, "Location: http://example.com/new\r\n") ||
+		!strings.Contains(body, `<A HREF="http://example.com/new">`) {
+		t.Errorf("redirect = %q", out)
+	}
+
+	// error page via SetError (no ruby needed).
+	res = NewResponse(cfg)
+	res.RequestMethod = "GET"
+	res.SetError(StatusNotFound("'/x' not found."))
+	out, _ = res.Bytes()
+	if !strings.HasPrefix(string(out), "HTTP/1.1 404 Not Found\r\n") ||
+		!strings.Contains(string(out), "<H1>Not Found</H1>") {
+		t.Errorf("error page = %q", out)
+	}
+
+	// cookie serialisation on the wire.
+	res = NewResponse(cfg)
+	res.RequestMethod = "GET"
+	res.SetStatus(200)
+	res.Set("content-type", "text/plain")
+	res.Body = []byte("x")
+	c := NewCookie("sid", "v")
+	c.Path = "/"
+	res.Cookies = append(res.Cookies, c)
+	out, _ = res.Bytes()
+	if !strings.Contains(string(out), "Set-Cookie: sid=v; Path=/\r\n") {
+		t.Errorf("cookie wire = %q", out)
+	}
+}
+
+// TestEscapeFormAndPathDeterministic covers the form/path escapers without ruby.
+func TestEscapeFormAndPathDeterministic(t *testing.T) {
+	if EscapeForm("a b&c=d") != "a+b%26c%3Dd" {
+		t.Errorf("EscapeForm = %q", EscapeForm("a b&c=d"))
+	}
+	if EscapePath("/a b/c+d") != "/a%20b/c+d" {
+		t.Errorf("EscapePath = %q", EscapePath("/a b/c+d"))
+	}
+	if Escape8bit("a\xc3\xa9") != "a%C3%A9" {
+		t.Errorf("Escape8bit = %q", Escape8bit("a\xc3\xa9"))
+	}
+	if codeString(404) != "404" {
+		t.Errorf("codeString = %q", codeString(404))
+	}
+	// computeKeepAlive close branch via a Connection: close request.
+	r, _ := ParseRequest([]byte("GET / HTTP/1.1\r\nConnection: close\r\n\r\n"), nil)
+	if r.KeepAlive() {
+		t.Error("Connection: close should disable keep-alive")
+	}
+	// computeKeepAlive explicit keep-alive branch on an HTTP/1.0 request (would
+	// otherwise default to false).
+	r, _ = ParseRequest([]byte("GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n"), nil)
+	if !r.KeepAlive() {
+		t.Error("Connection: keep-alive should enable keep-alive on 1.0")
+	}
+	// dotSegment + collapseSlashes via NormalizePath without oracle.
+	if p, _ := NormalizePath("/a//b/./c"); p != "/a/b/c" {
+		t.Errorf("normalize = %q", p)
+	}
+	// dotSegment at end-of-string ("/x/." -> "/x/").
+	if p, _ := NormalizePath("/x/."); p != "/x/" {
+		t.Errorf("normalize trailing dot = %q", p)
+	}
+	if Dequote(`"quoted"`) != "quoted" {
+		t.Errorf("dequote quoted = %q", Dequote(`"quoted"`))
 	}
 }
 
@@ -676,6 +827,16 @@ func TestURIUnits(t *testing.T) {
 	r, _ = ParseRequest([]byte("GET https://h/p HTTP/1.1\r\nHost: h\r\n\r\n"), nil)
 	if r.Port() != 443 {
 		t.Errorf("https default port = %d", r.Port())
+	}
+	// Plain Host header with a numeric port (the host:port parse branch).
+	r, _ = ParseRequest([]byte("GET /p HTTP/1.1\r\nHost: example.com:8080\r\n\r\n"), nil)
+	if r.Host() != "example.com" || r.Port() != 8080 {
+		t.Errorf("host hdr port = %q:%d", r.Host(), r.Port())
+	}
+	// Plain Host header with a non-numeric port falls back to 80.
+	r, _ = ParseRequest([]byte("GET /p HTTP/1.1\r\nHost: example.com:bad\r\n\r\n"), nil)
+	if r.Host() != "example.com:bad" || r.Port() != 80 {
+		t.Errorf("host hdr bad port = %q:%d", r.Host(), r.Port())
 	}
 	// Host header with IPv6 + port.
 	r, _ = ParseRequest([]byte("GET /p HTTP/1.1\r\nHost: [::1]:9000\r\n\r\n"), nil)
