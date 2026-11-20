@@ -1,2 +1,4 @@
 github.com/go-ruby-net-http/net-http v0.0.0-20260916095427-514f82c0c217 h1:6jgq2XLnWkigaLldPdW7SdOTr5Ar32yvdA3FreV0Lpo=
 github.com/go-ruby-net-http/net-http v0.0.0-20260916095427-514f82c0c217/go.mod h1:PiNQDuyrSPZX8OzApvgyn1fTjRNwx0KNO1vrzdAguEc=
+github.com/go-ruby-net-http/net-http v0.0.0-20261120132608-7b4c8644b203 h1:lJplGmwzNPLzYr2A4oseESETwEON96zytSQ/UrKgV7I=
+github.com/go-ruby-net-http/net-http v0.0.0-20261120132608-7b4c8644b203/go.mod h1:/vuDUwrurvJxlZ5nuRrBTlYE2YHUonCXLqLwqOAral0=
